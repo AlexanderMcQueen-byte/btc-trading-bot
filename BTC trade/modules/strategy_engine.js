@@ -74,6 +74,7 @@
 
 import {
     MACD, RSI, EMA, ADX, ATR, BollingerBands, StochasticRSI, OBV, MFI, ROC,
+    WilliamsR, CCI,
     bullishengulfingpattern, bearishengulfingpattern,
     morningstar, eveningstar,
     threewhitesoldiers, threeblackcrows,
@@ -341,6 +342,160 @@ export class StrategyEngine {
                 }
             }
         } catch (_) { /* non-critical */ }
+
+        // ── 16. SUPERTREND ───────────────────────────────────────────────
+        // ATR-based trend indicator used by professional crypto bots worldwide.
+        // Bullish when price > supertrend line, bearish when price < it.
+        // Crossovers (direction flip) are the highest-confidence signal.
+        const stPeriod = 10, stMult = 3;
+        let supertrendBullish = false, supertrendBearish = false;
+        let supertrendCrossUp = false, supertrendCrossDown = false;
+        try {
+            const stAtr = ATR.calculate({ high: highs, low: lows, close: closes, period: stPeriod });
+            if (stAtr.length >= 3) {
+                const finalUpperBands = [], finalLowerBands = [], stValues = [], stDirs = [];
+                for (let i = 0; i < stAtr.length; i++) {
+                    const idx = i + stPeriod - 1;
+                    const hl2 = (highs[idx] + lows[idx]) / 2;
+                    const a   = stAtr[i];
+                    let rawU = hl2 + stMult * a;
+                    let rawL = hl2 - stMult * a;
+                    let finU, finL;
+                    if (i === 0) {
+                        finU = rawU; finL = rawL;
+                    } else {
+                        const pc = closes[idx - 1];
+                        finU = (rawU < finalUpperBands[i-1] || pc > finalUpperBands[i-1]) ? rawU : finalUpperBands[i-1];
+                        finL = (rawL > finalLowerBands[i-1] || pc < finalLowerBands[i-1]) ? rawL : finalLowerBands[i-1];
+                    }
+                    finalUpperBands.push(finU);
+                    finalLowerBands.push(finL);
+                    let dir;
+                    if (i === 0) {
+                        dir = 1;
+                    } else {
+                        if (stValues[i-1] === finalUpperBands[i-1]) {
+                            dir = closes[idx] > finU ? -1 : 1;
+                        } else {
+                            dir = closes[idx] < finL ? 1 : -1;
+                        }
+                    }
+                    stValues.push(dir === 1 ? finU : finL);
+                    stDirs.push(dir);
+                }
+                const lastDir = stDirs[stDirs.length - 1];
+                const prevDir = stDirs[stDirs.length - 2];
+                supertrendBullish  = lastDir === -1;
+                supertrendBearish  = lastDir === 1;
+                supertrendCrossUp   = lastDir === -1 && prevDir === 1;
+                supertrendCrossDown = lastDir === 1  && prevDir === -1;
+            }
+        } catch (_) {}
+
+        // ── 17. RSI DIVERGENCE ────────────────────────────────────────────
+        // One of the most powerful reversal signals in crypto:
+        // Bullish divergence: price makes lower low, RSI makes higher low → reversal coming.
+        // Bearish divergence: price makes higher high, RSI makes lower high → reversal coming.
+        // Divergence appears BEFORE the price reversal — early warning system.
+        let bullishDivergence = false, bearishDivergence = false;
+        try {
+            const pivotWin = 5;
+            const rsiOffset = closes.length - rsiArr.length; // typically 14
+            const lookbackStart = Math.max(rsiOffset + pivotWin, closes.length - 60);
+            const pivotLows = [], pivotHighs = [];
+            for (let i = lookbackStart + pivotWin; i < closes.length - pivotWin; i++) {
+                const slice = closes.slice(i - pivotWin, i + pivotWin + 1);
+                const minV = Math.min(...slice), maxV = Math.max(...slice);
+                const rsiIdx = i - rsiOffset;
+                if (rsiIdx >= 0 && rsiIdx < rsiArr.length) {
+                    if (closes[i] <= minV) pivotLows.push({ price: closes[i], rsi: rsiArr[rsiIdx] });
+                    if (closes[i] >= maxV) pivotHighs.push({ price: closes[i], rsi: rsiArr[rsiIdx] });
+                }
+            }
+            if (pivotLows.length >= 2) {
+                const prev = pivotLows[pivotLows.length - 2];
+                const curr = pivotLows[pivotLows.length - 1];
+                if (curr.price < prev.price * 0.998 && curr.rsi > prev.rsi + 2) bullishDivergence = true;
+            }
+            if (pivotHighs.length >= 2) {
+                const prev = pivotHighs[pivotHighs.length - 2];
+                const curr = pivotHighs[pivotHighs.length - 1];
+                if (curr.price > prev.price * 1.002 && curr.rsi < prev.rsi - 2) bearishDivergence = true;
+            }
+        } catch (_) {}
+
+        // ── 18. VOLUME SURGE ──────────────────────────────────────────────
+        // Volume spikes 2x+ above average strongly confirm breakouts/breakdowns.
+        // Volume is the fuel — moves without volume are often fake.
+        const volAvgPeriod = 20;
+        const recentVols  = volumes.slice(-(volAvgPeriod + 1));
+        const avgVolume   = recentVols.slice(0, volAvgPeriod).reduce((a, b) => a + b, 0) / volAvgPeriod;
+        const curVolume   = volumes[volumes.length - 1];
+        const volRatio    = avgVolume > 0 ? curVolume / avgVolume : 1;
+        const volumeSurge = volRatio >= 2.0;
+        const upCandle    = closes[closes.length - 1] > closes[closes.length - 2];
+        const bullishVolumeSurge = volumeSurge && upCandle;
+        const bearishVolumeSurge = volumeSurge && !upCandle;
+
+        // ── 19. DAILY PIVOT POINTS ────────────────────────────────────────
+        // Calculated from the prior 24-hour session's H/L/C.
+        // S1/S2 = support levels, R1/R2 = resistance levels.
+        // Watched by professional traders — price magnetically returns to these.
+        let pivotPoint = 0, pivotR1 = 0, pivotS1 = 0, pivotR2 = 0, pivotS2 = 0;
+        let nearPivotSupport = false, nearPivotResistance = false;
+        try {
+            const prevDay = ohlcv.slice(-48, -24);
+            if (prevDay.length >= 12) {
+                const dH  = Math.max(...prevDay.map(c => typeof c.high  !== 'undefined' ? c.high  : c[2]));
+                const dL  = Math.min(...prevDay.map(c => typeof c.low   !== 'undefined' ? c.low   : c[3]));
+                const dC  = prevDay[prevDay.length - 1];
+                const dCl = typeof dC.close !== 'undefined' ? dC.close : dC[4];
+                pivotPoint = (dH + dL + dCl) / 3;
+                pivotR1 = 2 * pivotPoint - dL;
+                pivotR2 = pivotPoint + (dH - dL);
+                pivotS1 = 2 * pivotPoint - dH;
+                pivotS2 = pivotPoint - (dH - dL);
+                const tol = currentPrice * 0.004; // 0.4% tolerance
+                nearPivotSupport    = [pivotPoint, pivotS1, pivotS2].some(p => p > 0 && Math.abs(currentPrice - p) < tol);
+                nearPivotResistance = [pivotR1, pivotR2].some(p => p > 0 && Math.abs(currentPrice - p) < tol);
+            }
+        } catch (_) {}
+
+        // ── 20. MARKET STRUCTURE (HH/HL vs LH/LL) ────────────────────────
+        // Divide the last 30 candles into thirds and compare High/Low progression.
+        // Healthy uptrend = HH + HL (each third higher than the last).
+        // Downtrend = LH + LL. This catches structural shifts early.
+        let structureBullish = false, structureBearish = false;
+        try {
+            const msLen  = 30;
+            const msH    = highs.slice(-msLen);
+            const msL    = lows.slice(-msLen);
+            const third  = Math.floor(msLen / 3);
+            const early  = { h: Math.max(...msH.slice(0, third)),         l: Math.min(...msL.slice(0, third)) };
+            const mid    = { h: Math.max(...msH.slice(third, 2*third)),   l: Math.min(...msL.slice(third, 2*third)) };
+            const recent = { h: Math.max(...msH.slice(2*third)),          l: Math.min(...msL.slice(2*third)) };
+            structureBullish = recent.h > mid.h && mid.h > early.h && recent.l > mid.l && mid.l > early.l;
+            structureBearish = recent.h < mid.h && mid.h < early.h && recent.l < mid.l && mid.l < early.l;
+        } catch (_) {}
+
+        // ── 21. WILLIAMS %R ───────────────────────────────────────────────
+        // Momentum oscillator similar to RSI but uses high/low range.
+        // Range: -100 (extremely oversold) to 0 (extremely overbought).
+        // Below -80 = oversold (reversal buy zone), above -20 = overbought.
+        const wrArr = WilliamsR.calculate({ high: highs, low: lows, close: closes, period: 14 });
+        const wr = wrArr.length ? wrArr[wrArr.length - 1] : -50;
+        const wrOversold   = wr < -80;
+        const wrOverbought = wr > -20;
+
+        // ── 22. CCI (Commodity Channel Index) ─────────────────────────────
+        // Measures how far price is from its statistical mean.
+        // Below -100: oversold (price unusually cheap), above +100: overbought.
+        // Particularly good for detecting cyclical reversal points in crypto.
+        const cciArr = CCI.calculate({ high: highs, low: lows, close: closes, period: 20 });
+        const cci = cciArr.length ? cciArr[cciArr.length - 1] : 0;
+        const cciOversold   = cci < -100;
+        const cciOverbought = cci > 100;
+        const cciExtreme    = cci < -200 || cci > 200; // Extreme readings = strong reversal
 
         // ── 16. DCA CHECK ────────────────────────────────────────────────
         if (currentPosition > 0 && averageEntry > 0) {
@@ -622,6 +777,91 @@ export class StrategyEngine {
             buyReasons.push(`Strong ADX ${adx.toFixed(0)} in bull trend — high-probability entry`);
         }
 
+        // ── SUPERTREND ────────────────────────────────────────────────────
+        if (supertrendCrossUp) {
+            buyScore += 2;
+            buyReasons.push('⚡ Supertrend crossover → BULLISH (direction flip confirmed)');
+        } else if (supertrendBullish) {
+            buyScore++;
+            buyReasons.push('Supertrend bullish (price riding above trend support)');
+        }
+        if (supertrendCrossDown) {
+            sellScore += 2;
+            sellReasons.push('⚡ Supertrend crossover → BEARISH (direction flip confirmed)');
+        } else if (supertrendBearish) {
+            sellScore++;
+            sellReasons.push('Supertrend bearish (price below trend resistance)');
+        }
+
+        // ── RSI DIVERGENCE ────────────────────────────────────────────────
+        if (bullishDivergence) {
+            buyScore += 2;
+            buyReasons.push('🔄 RSI Bullish Divergence — price lower low, RSI higher low (early reversal signal)');
+        }
+        if (bearishDivergence) {
+            sellScore += 2;
+            sellReasons.push('🔄 RSI Bearish Divergence — price higher high, RSI lower high (early reversal signal)');
+        }
+
+        // ── VOLUME SURGE ──────────────────────────────────────────────────
+        if (bullishVolumeSurge) {
+            buyScore++;
+            buyReasons.push(`🔥 Volume surge ${volRatio.toFixed(1)}× avg — bullish breakout confirmed by volume`);
+        }
+        if (bearishVolumeSurge) {
+            sellScore++;
+            sellReasons.push(`🔥 Volume surge ${volRatio.toFixed(1)}× avg — bearish breakdown confirmed by volume`);
+        }
+
+        // ── MARKET STRUCTURE ──────────────────────────────────────────────
+        if (structureBullish) {
+            buyScore++;
+            buyReasons.push('Market structure: Higher Highs + Higher Lows (structurally bullish)');
+        }
+        if (structureBearish) {
+            sellScore++;
+            sellReasons.push('Market structure: Lower Highs + Lower Lows (structurally bearish)');
+        }
+
+        // ── DAILY PIVOT POINTS ────────────────────────────────────────────
+        if (nearPivotSupport && !bearTrend) {
+            buyScore++;
+            buyReasons.push(`Price at daily pivot support (PP/S1/S2 zone $${pivotPoint.toFixed(0)})`);
+        }
+        if (nearPivotResistance && !bullTrend) {
+            sellScore++;
+            sellReasons.push(`Price at daily pivot resistance (R1/R2 zone $${pivotR1.toFixed(0)})`);
+        }
+
+        // ── WILLIAMS %R ───────────────────────────────────────────────────
+        if (wrOversold) {
+            buyScore++;
+            buyReasons.push(`Williams %R oversold (${wr.toFixed(0)}) — momentum exhaustion at lows`);
+        }
+        if (wrOverbought) {
+            sellScore++;
+            sellReasons.push(`Williams %R overbought (${wr.toFixed(0)}) — momentum exhaustion at highs`);
+        }
+
+        // ── CCI ───────────────────────────────────────────────────────────
+        if (cciOversold) {
+            buyScore++;
+            buyReasons.push(`CCI oversold (${cci.toFixed(0)}) — price well below statistical mean`);
+        }
+        if (cciOverbought) {
+            sellScore++;
+            sellReasons.push(`CCI overbought (${cci.toFixed(0)}) — price well above statistical mean`);
+        }
+        // Extra weight at extreme CCI readings (> ±200)
+        if (cciExtreme && cci < 0 && !bearTrend) {
+            buyScore++;
+            buyReasons.push(`CCI extreme (${cci.toFixed(0)}) — statistically rare oversold zone`);
+        }
+        if (cciExtreme && cci > 0 && !bullTrend) {
+            sellScore++;
+            sellReasons.push(`CCI extreme (${cci.toFixed(0)}) — statistically rare overbought zone`);
+        }
+
         // ── DECISION ──────────────────────────────────────────────────────
         const indicators = {
             price: currentPrice,
@@ -647,7 +887,21 @@ export class StrategyEngine {
             fearGreedValue: fearGreed?.value ?? null,
             fearGreedClass: fearGreed?.classification ?? null,
             bearTrend,
-            h4BearTrend
+            h4BearTrend,
+            supertrendBullish,
+            supertrendBearish,
+            supertrendCrossUp,
+            supertrendCrossDown,
+            bullishDivergence,
+            bearishDivergence,
+            volRatio: +volRatio.toFixed(2),
+            structureBullish,
+            structureBearish,
+            wr: +wr.toFixed(1),
+            cci: +cci.toFixed(1),
+            pivotPoint: pivotPoint > 0 ? +pivotPoint.toFixed(2) : null,
+            pivotR1: pivotR1 > 0 ? +pivotR1.toFixed(2) : null,
+            pivotS1: pivotS1 > 0 ? +pivotS1.toFixed(2) : null
         };
 
         if (buyScore >= this.minBuyScore && buyScore > sellScore) {
