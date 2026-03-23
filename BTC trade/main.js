@@ -359,7 +359,11 @@ async function tradingLoop() {
             // ── GRID TRADING (ranging market) ─────────────────────────────
             // When ADX is low (no trend), hand control to the grid trader.
             // Grid trader is profitable in sideways markets where trend strategies fail.
-            const gridResult = gridTrader.evaluate(close, atr, adx, BOT_STATE.currentBalance);
+            // Safety: bearTrend + h4BearTrend passed in — grid will suspend itself in downtrends.
+            const bearTrend    = signalData.indicators?.bearTrend    ?? false;
+            const h4BearTrend  = signalData.indicators?.h4BearTrend  ?? false;
+            const gridResult = gridTrader.evaluate(close, atr, adx, BOT_STATE.currentBalance, bearTrend, h4BearTrend);
+
             if (gridResult.action === 'GRID_BUY' && gridResult.size > 0 && BOT_STATE.currentBalance > close * gridResult.size) {
                 const order = await exchange.createMarketBuyOrder(symbol, gridResult.size);
                 if (order && order.status === 'closed') {
@@ -373,21 +377,24 @@ async function tradingLoop() {
                         : close;
                     logger.info(`[GRID] BUY executed: ${gridResult.size} BTC @ $${close} | ${gridResult.reason}`);
                 }
-            } else if (gridResult.action === 'GRID_SELL' && BOT_STATE.currentPosition > 0) {
+            } else if ((gridResult.action === 'GRID_SELL' || gridResult.action === 'GRID_EMERGENCY_SELL') && BOT_STATE.currentPosition > 0) {
                 const gridSellAmount = Math.min(BOT_STATE.currentPosition, gridResult.size || BOT_STATE.currentPosition);
-                const order = await exchange.createMarketSellOrder(symbol, gridSellAmount);
-                if (order && order.status === 'closed') {
-                    const proceeds = close * gridSellAmount;
-                    const fee = (order.fee?.cost) ?? proceeds * 0.001;
-                    const profit = (close - BOT_STATE.averageEntry) * gridSellAmount;
-                    BOT_STATE.currentBalance += (proceeds - fee);
-                    BOT_STATE.totalFeesPaid += fee;
-                    BOT_STATE.realizedPnL += profit;
-                    if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
-                    BOT_STATE.currentPosition -= gridSellAmount;
-                    if (BOT_STATE.currentPosition < 0.000001) { BOT_STATE.currentPosition = 0; BOT_STATE.averageEntry = 0; }
-                    riskManager.recordTrade(profit, Math.abs(atr * gridSellAmount));
-                    logger.info(`[GRID] SELL executed: ${gridSellAmount} BTC @ $${close} | PnL: $${profit.toFixed(2)} | ${gridResult.reason}`);
+                if (gridSellAmount > 0) {
+                    const order = await exchange.createMarketSellOrder(symbol, gridSellAmount);
+                    if (order && order.status === 'closed') {
+                        const proceeds = close * gridSellAmount;
+                        const fee = (order.fee?.cost) ?? proceeds * 0.001;
+                        const profit = (close - BOT_STATE.averageEntry) * gridSellAmount;
+                        BOT_STATE.currentBalance += (proceeds - fee);
+                        BOT_STATE.totalFeesPaid += fee;
+                        BOT_STATE.realizedPnL += profit;
+                        if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
+                        BOT_STATE.currentPosition -= gridSellAmount;
+                        if (BOT_STATE.currentPosition < 0.000001) { BOT_STATE.currentPosition = 0; BOT_STATE.averageEntry = 0; }
+                        riskManager.recordTrade(profit, Math.abs(atr * gridSellAmount));
+                        const tag = gridResult.action === 'GRID_EMERGENCY_SELL' ? '🚨 EMERGENCY' : '';
+                        logger.info(`[GRID] ${tag} SELL executed: ${gridSellAmount} BTC @ $${close} | PnL: $${profit.toFixed(2)} | ${gridResult.reason}`);
+                    }
                 }
             }
 
@@ -411,15 +418,43 @@ async function tradingLoop() {
                         const stopPrice = strategy.getAtrStopLoss(ohlcv, entryPrice, 'BUY', ATR_MULT);
 
                         // Minimum reward:risk check — only take trades with at least 1.5:1 upside.
-                        // Target = distance to recent 20-candle swing high (local resistance).
-                        // This is dynamic: if resistance is far away the trade is viable; if not, skip.
-                        const recentHighs = ohlcv.slice(-20).map(c => (typeof c.high !== 'undefined' ? c.high : c[2]));
-                        const nearResistanceTarget = Math.max(...recentHighs);
+                        // Tiered resistance target:
+                        //   1. 20-candle swing high (tight local resistance)
+                        //   2. 50-candle swing high (wider structure)
+                        //   3. ATR-extension target (for ATH breakouts where no overhead resistance exists)
+                        const MIN_RR = 1.5;
                         const stopDistance = entryPrice - stopPrice;
-                        const targetDistance = nearResistanceTarget - entryPrice; // How far to swing high
+
+                        const getHighs = (n) => ohlcv.slice(-n).map(c => (typeof c.high !== 'undefined' ? c.high : c[2]));
+                        const swing20  = Math.max(...getHighs(20));
+                        const swing50  = Math.max(...getHighs(50));
+                        // ATR-extension: when at ATH with no overhead resistance, expect a 3× ATR move
+                        const atrExtTarget = entryPrice + Math.max(atr * 3, stopDistance * MIN_RR);
+
+                        let nearResistanceTarget = swing20;
+                        let rrMethod = '20-candle swing';
+
+                        const rr20 = stopDistance > 0 && (swing20 - entryPrice) > 0 ? (swing20 - entryPrice) / stopDistance : 0;
+                        if (rr20 >= MIN_RR) {
+                            nearResistanceTarget = swing20;
+                            rrMethod = '20-candle swing';
+                        } else {
+                            const rr50 = stopDistance > 0 && (swing50 - entryPrice) > 0 ? (swing50 - entryPrice) / stopDistance : 0;
+                            if (rr50 >= MIN_RR) {
+                                nearResistanceTarget = swing50;
+                                rrMethod = '50-candle swing';
+                            } else if (!bearTrend) {
+                                // In a bull trend with no overhead resistance (ATH breakout),
+                                // use ATR-extension as the measured move target
+                                nearResistanceTarget = atrExtTarget;
+                                rrMethod = 'ATR extension (breakout)';
+                            }
+                        }
+
+                        const targetDistance = nearResistanceTarget - entryPrice;
                         const rewardRiskRatio = stopDistance > 0 && targetDistance > 0 ? targetDistance / stopDistance : 0;
-                        if (rewardRiskRatio < 1.5) {
-                            logger.info(`⛔ BUY skipped — R:R ${rewardRiskRatio.toFixed(2)} < 1.5 minimum (risk: $${stopDistance.toFixed(0)}, reward to resistance $${nearResistanceTarget.toFixed(0)}: $${targetDistance.toFixed(0)})`);
+                        if (rewardRiskRatio < MIN_RR) {
+                            logger.info(`⛔ BUY skipped — R:R ${rewardRiskRatio.toFixed(2)} < ${MIN_RR} (risk: $${stopDistance.toFixed(0)}, target $${nearResistanceTarget.toFixed(0)} via ${rrMethod}: $${targetDistance.toFixed(0)})`);
                         } else {
 
                         // Kelly + volatility-scaled position size
