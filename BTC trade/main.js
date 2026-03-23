@@ -146,8 +146,8 @@ async function tradingLoop() {
         useKelly: true
     });
     const exchange = new ExchangeService({
-        apiKey: process.env.API_KEY,
-        apiSecret: process.env.API_SECRET,
+        apiKey:    process.env.BINANCE_API_KEY    || process.env.API_KEY,
+        apiSecret: process.env.BINANCE_SECRET_KEY || process.env.API_SECRET,
         exchangeId: process.env.EXCHANGE_ID || 'binance',
         logger
     });
