@@ -6,13 +6,21 @@
   "type": "module",
   "scripts": {
     "start": "node main.js",
-    "dev": "node --watch main.js"
+    "dev": "node --watch main.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --forceExit"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {}
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.1",
     "better-sqlite3": "^12.8.0",
     "ccxt": "^4.5.44",
+    "cors": "^2.8.6",
     "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "jest": "^30.3.0",
     "technicalindicators": "^3.1.0",
     "winston": "^3.19.0",
     "ws": "^8.18.0"
