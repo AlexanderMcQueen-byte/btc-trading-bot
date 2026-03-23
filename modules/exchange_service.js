@@ -129,16 +129,20 @@ export class ExchangeService {
             return { USDT: { free: 10000, used: 0, total: 10000 } };
         }
         try {
-            const balance = await withRetry(
-                () => this.exchange.fetchBalance(),
-                [],
-                5,
-                this.logger
-            );
+            // Use spot account endpoint — avoids the /sapi/ capital endpoint
+            // which is NOT available on testnet or from geo-restricted servers.
+            const balance = await this.exchange.fetchBalance({ type: 'spot' });
             this.logger.info('Fetched account balance');
             logApiUsage({ endpoint: 'fetchBalance', params: {}, status: 'success' });
             return balance;
         } catch (err) {
+            // 451 = geo-restricted endpoint (e.g. /sapi/ not available on testnet).
+            // Don't retry — return null immediately so caller can handle gracefully.
+            if (isGeoRestricted(err) || err.message.includes('451')) {
+                this.logger.warn(`fetchBalance: geo-restricted endpoint (451). Returning null — caller will use fallback balance.`);
+                logApiUsage({ endpoint: 'fetchBalance', params: {}, status: 'geo-restricted' });
+                return null;
+            }
             this.logger.error(`fetchBalance error: ${err.message}`);
             logApiUsage({ endpoint: 'fetchBalance', params: {}, status: 'error' });
             return null;
