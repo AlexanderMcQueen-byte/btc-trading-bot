@@ -1,0 +1,20 @@
+{
+  "name": "fintech-btc-bot",
+  "version": "1.0.0",
+  "description": "Modular BTC Trading Bot with MCP for Panel Hosting",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node main.js",
+    "dev": "node --watch main.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "better-sqlite3": "^12.8.0",
+    "ccxt": "^4.5.44",
+    "dotenv": "^16.4.5",
+    "technicalindicators": "^3.1.0",
+    "winston": "^3.19.0",
+    "ws": "^8.18.0"
+  }
+}
