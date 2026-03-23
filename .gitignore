@@ -1,6 +1,25 @@
+# Dependencies
 node_modules/
-  .env
-  data/bot.db
-  logs/
-  *.log
-  
+
+# Environment secrets — NEVER commit these
+.env
+*.env
+
+# Database files
+data/bot.db
+data/bot.db-shm
+data/bot.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+
+# Sensitive config
+ip_whitelist.txt
+
+# OS
+.DS_Store
+Thumbs.db
