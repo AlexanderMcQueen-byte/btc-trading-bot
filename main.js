@@ -146,6 +146,7 @@ async function tradingLoop() {
     // Fetch Fear & Greed Index (updates hourly, cached internally)
     let fearGreed = null;
     let lastFearGreedFetch = 0;
+    let loopCycle = 0; // Counts main loop iterations for periodic balance sync
 
     // Hardware kill switch check
     if (checkKillSwitch()) {
@@ -161,19 +162,70 @@ async function tradingLoop() {
         process.exit(1);
     }
 
-    // Load persisted state for live trading only.
-    // Simulation always runs with a clean paper-trade state to avoid accumulating fake positions.
+    // ── LIVE MODE: Seed state from real exchange balances ─────────────────
+    // The exchange is the single source of truth for what we actually own.
+    // We never trust a hardcoded or cached balance over the real account.
     if (!exchange.simulationMode) {
-        const persisted = db.loadState('bot_state');
-        if (persisted) {
-            Object.assign(BOT_STATE, persisted);
+        logger.info('Fetching real account balances from exchange...');
+        const accountBalance = await exchange.fetchBalance();
+
+        if (accountBalance) {
+            // USDT available to trade
+            const usdtFree  = accountBalance?.USDT?.free  ?? accountBalance?.['USDT']?.free  ?? 0;
+            const usdtTotal = accountBalance?.USDT?.total ?? accountBalance?.['USDT']?.total ?? 0;
+
+            // BTC already held (existing position)
+            const btcFree  = accountBalance?.BTC?.free  ?? accountBalance?.['BTC']?.free  ?? 0;
+            const btcTotal = accountBalance?.BTC?.total ?? accountBalance?.['BTC']?.total ?? 0;
+
+            // Also detect the base asset of the symbol (e.g. BTC in BTC/USDT)
+            const baseAsset = symbol.split('/')[0];
+            const quoteAsset = symbol.split('/')[1] || 'USDT';
+            const realBaseFree  = accountBalance?.[baseAsset]?.free  ?? btcFree;
+            const realBaseLocked= (accountBalance?.[baseAsset]?.total ?? btcTotal) - realBaseFree;
+            const realQuoteFree = accountBalance?.[quoteAsset]?.free ?? usdtFree;
+
+            // Apply real balances — exchange is ground truth
+            BOT_STATE.currentBalance = realQuoteFree;
+            BOT_STATE.currentPosition = realBaseFree + realBaseLocked; // Include locked (in open orders)
+
+            // Load persisted state for averageEntry and PnL history
+            // (exchange doesn't tell us our average cost basis)
+            const persisted = db.loadState('bot_state');
+            if (persisted) {
+                BOT_STATE.averageEntry  = persisted.averageEntry  || 0;
+                BOT_STATE.realizedPnL   = persisted.realizedPnL   || 0;
+                BOT_STATE.winTrades     = persisted.winTrades     || 0;
+                BOT_STATE.lossTrades    = persisted.lossTrades    || 0;
+                BOT_STATE.maxDrawdown   = persisted.maxDrawdown   || 0;
+                BOT_STATE.totalFeesPaid = persisted.totalFeesPaid || 0;
+            }
+
+            // If we hold BTC but have no persisted entry price, warn — use current price as estimate
+            if (BOT_STATE.currentPosition > 0.000001 && BOT_STATE.averageEntry === 0) {
+                const currentPrice = ohlcv[ohlcv.length - 1][4] ?? ohlcv[ohlcv.length - 1].close;
+                BOT_STATE.averageEntry = currentPrice;
+                logger.warn(`⚠️  Holding ${BOT_STATE.currentPosition.toFixed(6)} ${baseAsset} but no recorded entry price — using current price $${currentPrice.toFixed(0)} as estimate. PnL tracking may be inaccurate for this position.`);
+            }
+
             BOT_STATE.isRunning = true;
             BOT_STATE.circuitBreakerActive = false;
-            BOT_STATE.initialDailyBalance = BOT_STATE.currentBalance;
-            BOT_STATE.peakBalance = Math.max(BOT_STATE.currentBalance, BOT_STATE.peakBalance || BOT_STATE.currentBalance);
-            logger.info(`Loaded persisted state. Session baseline: $${BOT_STATE.currentBalance.toFixed(2)} | Position: ${BOT_STATE.currentPosition} BTC`);
+            BOT_STATE.initialDailyBalance = BOT_STATE.currentBalance + (BOT_STATE.currentPosition * (ohlcv[ohlcv.length - 1][4] ?? ohlcv[ohlcv.length - 1].close));
+            BOT_STATE.peakBalance = Math.max(BOT_STATE.initialDailyBalance, BOT_STATE.peakBalance || 0);
+
+            logger.info(`✅ Account loaded from exchange:`);
+            logger.info(`   ${quoteAsset} balance : $${BOT_STATE.currentBalance.toFixed(2)} (available to trade)`);
+            logger.info(`   ${baseAsset} position : ${BOT_STATE.currentPosition.toFixed(6)} ${baseAsset}${BOT_STATE.currentPosition > 0 ? ` (avg entry: $${BOT_STATE.averageEntry.toFixed(0)})` : ' (none)'}`);
+            logger.info(`   Portfolio value: $${BOT_STATE.initialDailyBalance.toFixed(2)}`);
+        } else {
+            logger.error('Could not fetch account balance. Halting to protect funds.');
+            process.exit(1);
         }
-        // Subscribe to real-time ticker via WebSocket (live mode only)
+
+        // Update risk manager with real balance
+        riskManager.updateBalance(BOT_STATE.currentBalance);
+
+        // Subscribe to real-time ticker via WebSocket
         subscribeTicker(symbol.replace('/', '').toLowerCase(), (msg) => {
             // stopLossManager.updateTrailing(symbol, msg.p ? parseFloat(msg.p) : null);
         });
@@ -195,6 +247,8 @@ async function tradingLoop() {
                 continue;
             }
 
+            loopCycle++;
+
             // Refresh Fear & Greed Index every hour
             if (Date.now() - lastFearGreedFetch > 60 * 60 * 1000) {
                 try {
@@ -204,6 +258,34 @@ async function tradingLoop() {
                         logger.info(`Fear & Greed: ${fearGreed.value} (${fearGreed.classification}) | Trend: ${fearGreed.trend}`);
                     }
                 } catch (_) { /* non-critical — continue without it */ }
+            }
+
+            // Sync real account balances every 10 cycles (live mode only)
+            // Prevents drift from fees, partial fills, or external account changes.
+            if (!exchange.simulationMode && loopCycle % 10 === 0) {
+                try {
+                    const syncedBalance = await exchange.fetchBalance();
+                    if (syncedBalance) {
+                        const baseAsset  = symbol.split('/')[0];
+                        const quoteAsset = symbol.split('/')[1] || 'USDT';
+                        const realQuoteFree = syncedBalance?.[quoteAsset]?.free ?? 0;
+                        const realBaseFree  = syncedBalance?.[baseAsset]?.free  ?? 0;
+                        const realBaseLocked = (syncedBalance?.[baseAsset]?.total ?? realBaseFree) - realBaseFree;
+                        const realBaseTotal = realBaseFree + realBaseLocked;
+
+                        const prevBalance  = BOT_STATE.currentBalance;
+                        const prevPosition = BOT_STATE.currentPosition;
+                        BOT_STATE.currentBalance  = realQuoteFree;
+                        BOT_STATE.currentPosition = realBaseTotal;
+                        riskManager.updateBalance(realQuoteFree);
+
+                        if (Math.abs(prevBalance - realQuoteFree) > 0.01 || Math.abs(prevPosition - realBaseTotal) > 0.000001) {
+                            logger.info(`[Sync] Balance reconciled | ${quoteAsset}: $${realQuoteFree.toFixed(2)} (was $${prevBalance.toFixed(2)}) | ${baseAsset}: ${realBaseTotal.toFixed(6)} (was ${prevPosition.toFixed(6)})`);
+                        }
+                    }
+                } catch (syncErr) {
+                    logger.warn(`Balance sync failed (non-critical): ${syncErr.message}`);
+                }
             }
 
             // Fetch latest candle (keep up to 500 candles — enough for all indicators including EMA200)
