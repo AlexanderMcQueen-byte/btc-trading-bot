@@ -3,8 +3,8 @@ import 'dotenv/config';
 
 (async () => {
   const exchange = new ccxt.binance({
-    apiKey: process.env.API_KEY,
-    secret: process.env.API_SECRET,
+    apiKey: process.env.BINANCE_API_KEY || process.env.API_KEY,
+    secret: process.env.BINANCE_SECRET_KEY || process.env.API_SECRET,
     enableRateLimit: true,
     options: { defaultType: 'spot' },
     urls: {
