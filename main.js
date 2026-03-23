@@ -169,6 +169,18 @@ async function tradingLoop() {
         logger.info('Fetching real account balances from exchange...');
         const accountBalance = await exchange.fetchBalance();
 
+        if (!accountBalance) {
+            // Testnet or restricted server: wallet/sapi endpoints may not be available.
+            // In fully live mode this is a hard error; in testnet/paper, warn and continue.
+            const isFullyLive = process.env.TESTNET !== 'true' && process.env.PAPER_TRADE !== 'true';
+            if (isFullyLive) {
+                logger.error('Could not fetch account balance from exchange. Halting to protect funds.');
+                process.exit(1);
+            } else {
+                logger.warn('⚠️  Could not fetch live balance (testnet wallet endpoints may be geo-restricted). Continuing with paper-trade starting balance.');
+            }
+        }
+
         if (accountBalance) {
             // USDT available to trade
             const usdtFree  = accountBalance?.USDT?.free  ?? accountBalance?.['USDT']?.free  ?? 0;
@@ -217,9 +229,6 @@ async function tradingLoop() {
             logger.info(`   ${quoteAsset} balance : $${BOT_STATE.currentBalance.toFixed(2)} (available to trade)`);
             logger.info(`   ${baseAsset} position : ${BOT_STATE.currentPosition.toFixed(6)} ${baseAsset}${BOT_STATE.currentPosition > 0 ? ` (avg entry: $${BOT_STATE.averageEntry.toFixed(0)})` : ' (none)'}`);
             logger.info(`   Portfolio value: $${BOT_STATE.initialDailyBalance.toFixed(2)}`);
-        } else {
-            logger.error('Could not fetch account balance. Halting to protect funds.');
-            process.exit(1);
         }
 
         // Update risk manager with real balance
