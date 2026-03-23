@@ -361,30 +361,42 @@ async function tradingLoop() {
             // ── TREND STRATEGY (trending market) ─────────────────────────
             // Only run trend signals when grid is NOT active (different regimes)
             if (!gridTrader.active) {
-                if (["BUY", "BUY_DCA"].includes(signalData.signal)) {
+                if (["BUY", "BUY_DCA"].includes(signalData.signal) && BOT_STATE.currentPosition === 0) {
                     const entryPrice = close;
-                    // ATR-based stop loss — never use a fixed % in crypto
-                    const stopPrice = strategy.getAtrStopLoss(ohlcv, entryPrice, 'BUY', 2);
-                    // Kelly + volatility-scaled position size
-                    const buyAmount = riskManager.getPositionSize(entryPrice, stopPrice, atr);
-                    if (buyAmount <= 0) {
-                        logger.warn('Position size is zero — skipping BUY (check balance/risk params).');
+
+                    // ── Balance check — always verify funds before sizing ──────────────
+                    if (BOT_STATE.currentBalance <= 0) {
+                        logger.warn(`Skipping BUY — no USDT balance available ($${BOT_STATE.currentBalance.toFixed(2)}).`);
                     } else {
-                        const order = await exchange.createMarketBuyOrder(symbol, buyAmount);
-                        if (order && order.status === 'closed') {
-                            const cost = close * buyAmount;
-                            const fee = (order.fee?.cost) ?? cost * 0.001;
-                            const prevPos = BOT_STATE.currentPosition;
-                            BOT_STATE.currentPosition += buyAmount;
-                            BOT_STATE.averageEntry = prevPos > 0
-                                ? (BOT_STATE.averageEntry * prevPos + close * buyAmount) / BOT_STATE.currentPosition
-                                : close;
-                            BOT_STATE.currentBalance -= (cost + fee);
-                            BOT_STATE.totalFeesPaid += fee;
-                            db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'BUY', price: close, amount: buyAmount, fee });
-                            logger.info(`Executed BUY: ${buyAmount} BTC @ $${close} | Stop: $${stopPrice.toFixed(0)} | ${riskManager.getKellyStats()}`);
-                            // Set ATR trailing stop
-                            stopLossManager.setStop(symbol, entryPrice, stopPrice, 'BUY', true, atr * 2);
+                        // ATR-based stop loss — never use a fixed % in crypto
+                        const stopPrice = strategy.getAtrStopLoss(ohlcv, entryPrice, 'BUY', 2);
+                        // Kelly + volatility-scaled position size
+                        let buyAmount = riskManager.getPositionSize(entryPrice, stopPrice, atr);
+
+                        // Hard cap: never spend more than 95% of available balance
+                        // (reserve 5% buffer for fees and rounding)
+                        const maxAffordable = Math.floor((BOT_STATE.currentBalance * 0.95) / close * 1e6) / 1e6;
+                        buyAmount = Math.min(buyAmount, maxAffordable);
+
+                        const totalCost = close * buyAmount * 1.001; // include 0.1% fee estimate
+                        if (buyAmount <= 0) {
+                            logger.warn('Position size is zero — skipping BUY (check balance/risk params).');
+                        } else if (totalCost > BOT_STATE.currentBalance) {
+                            logger.warn(`Skipping BUY — insufficient balance: need $${totalCost.toFixed(2)}, have $${BOT_STATE.currentBalance.toFixed(2)}.`);
+                        } else {
+                            const order = await exchange.createMarketBuyOrder(symbol, buyAmount);
+                            if (order && order.status === 'closed') {
+                                const cost = close * buyAmount;
+                                const fee = (order.fee?.cost) ?? cost * 0.001;
+                                BOT_STATE.currentPosition = buyAmount;
+                                BOT_STATE.averageEntry = close;
+                                BOT_STATE.currentBalance -= (cost + fee);
+                                BOT_STATE.totalFeesPaid += fee;
+                                db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'BUY', price: close, amount: buyAmount, fee });
+                                logger.info(`Executed BUY: ${buyAmount} BTC @ $${close} | Stop: $${stopPrice.toFixed(0)} | ${riskManager.getKellyStats()}`);
+                                // Set ATR trailing stop
+                                stopLossManager.setStop(symbol, entryPrice, stopPrice, 'BUY', true, atr * 2);
+                            }
                         }
                     }
                 } else if (signalData.signal === "SELL" && BOT_STATE.currentPosition > 0) {
