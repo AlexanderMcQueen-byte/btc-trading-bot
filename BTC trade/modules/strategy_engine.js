@@ -645,7 +645,9 @@ export class StrategyEngine {
             fib382: +fib382.toFixed(2),
             h4Trend: h4BullTrend ? 'BULL' : h4BearTrend ? 'BEAR' : 'NEUTRAL',
             fearGreedValue: fearGreed?.value ?? null,
-            fearGreedClass: fearGreed?.classification ?? null
+            fearGreedClass: fearGreed?.classification ?? null,
+            bearTrend,
+            h4BearTrend
         };
 
         if (buyScore >= this.minBuyScore && buyScore > sellScore) {
