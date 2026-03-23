@@ -1,6 +1,8 @@
 import { loadEnv } from './modules/secure_env.js';
 import { RiskManager } from './modules/risk_manager.js';
 import { StopLossManager } from './modules/stop_loss_manager.js';
+import { GridTrader } from './modules/grid_trader.js';
+import { getFearGreedIndex } from './modules/fear_greed.js';
 import { checkKillSwitch } from './modules/hardware_kill_switch.js';
 import { sendAlert } from './modules/alerting.js';
 import { subscribeTicker } from './modules/ws_feed.js';
@@ -21,10 +23,17 @@ import { BotDatabase } from './modules/database.js';
 loadEnv();
 
 // IP Whitelist check (cloud security)
+// In LIVE mode: hard exit if IP not whitelisted (prevents API keys being used from unknown servers).
+// In DEV/SIMULATION: warn only — Replit rotates IPs frequently.
 const serverIp = getServerIp();
 if (!isIpWhitelisted(serverIp)) {
-    logger.error(`Server IP ${serverIp} not whitelisted. Exiting for security.`);
-    process.exit(1);
+    const isLive = process.env.TESTNET !== 'true' && process.env.PAPER_TRADE !== 'true';
+    if (isLive) {
+        logger.error(`Server IP ${serverIp} not whitelisted. Exiting for security (live mode).`);
+        process.exit(1);
+    } else {
+        logger.warn(`Server IP ${serverIp} not in whitelist — continuing in simulation/testnet mode.`);
+    }
 }
 
 // Risk and stop-loss managers
@@ -118,12 +127,14 @@ async function tradingLoop() {
         minBuyScore: 3,
         minSellScore: 3
     });
+    const gridTrader = new GridTrader({ logger });
     const symbol = process.env.DEFAULT_SYMBOL || "BTC/USDT";
-    // Initialize risk manager with current balance and env risk params
+
     riskManager = new RiskManager({
         balance: BOT_STATE.currentBalance,
         maxRiskPct: parseFloat(process.env.MAX_RISK_PCT) || 0.01,
-        stopLossPct: parseFloat(process.env.STOP_LOSS_PCT) || 0.02
+        stopLossPct: parseFloat(process.env.STOP_LOSS_PCT) || 0.02,
+        useKelly: true
     });
     const exchange = new ExchangeService({
         apiKey: process.env.API_KEY,
@@ -131,6 +142,10 @@ async function tradingLoop() {
         exchangeId: process.env.EXCHANGE_ID || 'binance',
         logger
     });
+
+    // Fetch Fear & Greed Index (updates hourly, cached internally)
+    let fearGreed = null;
+    let lastFearGreedFetch = 0;
 
     // Hardware kill switch check
     if (checkKillSwitch()) {
@@ -180,15 +195,26 @@ async function tradingLoop() {
                 continue;
             }
 
-            // Fetch latest candle
+            // Refresh Fear & Greed Index every hour
+            if (Date.now() - lastFearGreedFetch > 60 * 60 * 1000) {
+                try {
+                    fearGreed = await getFearGreedIndex();
+                    lastFearGreedFetch = Date.now();
+                    if (fearGreed.available) {
+                        logger.info(`Fear & Greed: ${fearGreed.value} (${fearGreed.classification}) | Trend: ${fearGreed.trend}`);
+                    }
+                } catch (_) { /* non-critical — continue without it */ }
+            }
+
+            // Fetch latest candle (keep up to 500 candles — enough for all indicators including EMA200)
             const newOhlcv = await exchange.fetchOHLCV(symbol, process.env.TIMEFRAME || '1h', undefined, 2);
             if (newOhlcv.length > 1) {
                 ohlcv.push(newOhlcv[newOhlcv.length - 1]);
-                if (ohlcv.length > 100) ohlcv.shift();
+                if (ohlcv.length > 500) ohlcv.shift();
             }
-            const close = ohlcv[ohlcv.length - 1][4];
+            const close = ohlcv[ohlcv.length - 1][4] ?? ohlcv[ohlcv.length - 1].close;
 
-            // Circuit breaker — use total portfolio value (USDT + BTC position at current price)
+            // Circuit breaker — uses total portfolio value (USDT + BTC at current price)
             const portfolioValue = BOT_STATE.currentBalance + (BOT_STATE.currentPosition * close);
             const dailyLossPct = (BOT_STATE.initialDailyBalance - portfolioValue) / BOT_STATE.initialDailyBalance;
             if (dailyLossPct >= (parseFloat(process.env.MAX_DAILY_LOSS_PCT) || 0.05)) {
@@ -199,57 +225,124 @@ async function tradingLoop() {
                 db.saveState('bot_state', BOT_STATE);
                 continue;
             }
-            const signalData = strategy.generateSignal(ohlcv, BOT_STATE.currentPosition, BOT_STATE.averageEntry);
+
+            // Generate strategy signal (pass Fear & Greed for sentiment scoring)
+            const signalData = strategy.generateSignal(ohlcv, BOT_STATE.currentPosition, BOT_STATE.averageEntry, fearGreed);
+            const adx = signalData.indicators?.adx ?? 30;
+            const atr = signalData.indicators?.atr ?? close * 0.02;
             logger.info(`[${new Date().toLocaleTimeString()}] Analysis: ${signalData.signal} | ${signalData.reason}`);
 
-            if (["BUY", "BUY_DCA"].includes(signalData.signal)) {
-                // ATR-based dynamic stop loss — adapts to current market volatility
-                const entryPrice = close;
-                const stopPrice = strategy.getAtrStopLoss(ohlcv, entryPrice, 'BUY', 2);
-                const buyAmount = riskManager.getPositionSize(entryPrice, stopPrice);
-                if (buyAmount <= 0) {
-                    logger.warn('Position size is zero. Skipping BUY.');
-                } else {
-                    const order = await exchange.createMarketBuyOrder(symbol, buyAmount);
-                    if (order && order.status === 'closed') {
-                        BOT_STATE.currentPosition += buyAmount;
-                        BOT_STATE.averageEntry = (BOT_STATE.averageEntry * (BOT_STATE.currentPosition - buyAmount) + close * buyAmount) / BOT_STATE.currentPosition;
-                        const fee = (order.fee && order.fee.cost) ? order.fee.cost : close * buyAmount * 0.001;
-                        BOT_STATE.currentBalance -= (close * buyAmount + fee);
-                        BOT_STATE.totalFeesPaid += fee;
-                        db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'BUY', price: close, amount: buyAmount });
-                        logger.info(`Executed BUY: ${buyAmount} ${symbol} @ $${close}`);
-                        stopLossManager.setStop(symbol, stopPrice, 'BUY');
-                    }
-                }
-            } else if (signalData.signal === "SELL" && BOT_STATE.currentPosition > 0) {
-                const sellAmount = BOT_STATE.currentPosition;
-                const order = await exchange.createMarketSellOrder(symbol, sellAmount);
+            // ── GRID TRADING (ranging market) ─────────────────────────────
+            // When ADX is low (no trend), hand control to the grid trader.
+            // Grid trader is profitable in sideways markets where trend strategies fail.
+            const gridResult = gridTrader.evaluate(close, atr, adx, BOT_STATE.currentBalance);
+            if (gridResult.action === 'GRID_BUY' && gridResult.size > 0 && BOT_STATE.currentBalance > close * gridResult.size) {
+                const order = await exchange.createMarketBuyOrder(symbol, gridResult.size);
                 if (order && order.status === 'closed') {
-                    const proceeds = close * sellAmount;
-                    const fee = (order.fee && order.fee.cost) ? order.fee.cost : proceeds * 0.001;
+                    const cost = close * gridResult.size;
+                    const fee = (order.fee?.cost) ?? cost * 0.001;
+                    BOT_STATE.currentBalance -= (cost + fee);
+                    BOT_STATE.totalFeesPaid += fee;
+                    BOT_STATE.currentPosition += gridResult.size;
+                    BOT_STATE.averageEntry = BOT_STATE.averageEntry > 0
+                        ? (BOT_STATE.averageEntry * (BOT_STATE.currentPosition - gridResult.size) + close * gridResult.size) / BOT_STATE.currentPosition
+                        : close;
+                    logger.info(`[GRID] BUY executed: ${gridResult.size} BTC @ $${close} | ${gridResult.reason}`);
+                }
+            } else if (gridResult.action === 'GRID_SELL' && BOT_STATE.currentPosition > 0) {
+                const gridSellAmount = Math.min(BOT_STATE.currentPosition, gridResult.size || BOT_STATE.currentPosition);
+                const order = await exchange.createMarketSellOrder(symbol, gridSellAmount);
+                if (order && order.status === 'closed') {
+                    const proceeds = close * gridSellAmount;
+                    const fee = (order.fee?.cost) ?? proceeds * 0.001;
+                    const profit = (close - BOT_STATE.averageEntry) * gridSellAmount;
                     BOT_STATE.currentBalance += (proceeds - fee);
                     BOT_STATE.totalFeesPaid += fee;
-                    const profit = (close - BOT_STATE.averageEntry) * sellAmount;
                     BOT_STATE.realizedPnL += profit;
                     if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
-                    db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: sellAmount });
-                    logger.info(`Executed SELL: ${sellAmount} ${symbol} @ $${close} | PnL: $${profit.toFixed(2)}`);
-                    BOT_STATE.currentPosition = 0;
-                    BOT_STATE.averageEntry = 0;
-                    stopLossManager.clearStop(symbol);
+                    BOT_STATE.currentPosition -= gridSellAmount;
+                    if (BOT_STATE.currentPosition < 0.000001) { BOT_STATE.currentPosition = 0; BOT_STATE.averageEntry = 0; }
+                    riskManager.recordTrade(profit, Math.abs(atr * gridSellAmount));
+                    logger.info(`[GRID] SELL executed: ${gridSellAmount} BTC @ $${close} | PnL: $${profit.toFixed(2)} | ${gridResult.reason}`);
                 }
             }
 
-            // Check stop-loss
-            const lastPrice = ohlcv[ohlcv.length - 1][4];
-            if (stopLossManager.shouldStop(symbol, lastPrice)) {
-                logger.error(`Stop-loss triggered for ${symbol} at price ${lastPrice}`);
-                sendAlert(`Stop-loss triggered for ${symbol} at price ${lastPrice}`);
-                const sellAmount = BOT_STATE.currentPosition;
-                if (sellAmount > 0) {
-                    await exchange.createMarketSellOrder(symbol, sellAmount);
-                    stopLossManager.clearStop(symbol);
+            // ── TREND STRATEGY (trending market) ─────────────────────────
+            // Only run trend signals when grid is NOT active (different regimes)
+            if (!gridTrader.active) {
+                if (["BUY", "BUY_DCA"].includes(signalData.signal)) {
+                    const entryPrice = close;
+                    // ATR-based stop loss — never use a fixed % in crypto
+                    const stopPrice = strategy.getAtrStopLoss(ohlcv, entryPrice, 'BUY', 2);
+                    // Kelly + volatility-scaled position size
+                    const buyAmount = riskManager.getPositionSize(entryPrice, stopPrice, atr);
+                    if (buyAmount <= 0) {
+                        logger.warn('Position size is zero — skipping BUY (check balance/risk params).');
+                    } else {
+                        const order = await exchange.createMarketBuyOrder(symbol, buyAmount);
+                        if (order && order.status === 'closed') {
+                            const cost = close * buyAmount;
+                            const fee = (order.fee?.cost) ?? cost * 0.001;
+                            const prevPos = BOT_STATE.currentPosition;
+                            BOT_STATE.currentPosition += buyAmount;
+                            BOT_STATE.averageEntry = prevPos > 0
+                                ? (BOT_STATE.averageEntry * prevPos + close * buyAmount) / BOT_STATE.currentPosition
+                                : close;
+                            BOT_STATE.currentBalance -= (cost + fee);
+                            BOT_STATE.totalFeesPaid += fee;
+                            db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'BUY', price: close, amount: buyAmount, fee });
+                            logger.info(`Executed BUY: ${buyAmount} BTC @ $${close} | Stop: $${stopPrice.toFixed(0)} | ${riskManager.getKellyStats()}`);
+                            // Set ATR trailing stop
+                            stopLossManager.setStop(symbol, entryPrice, stopPrice, 'BUY', true, atr * 2);
+                        }
+                    }
+                } else if (signalData.signal === "SELL" && BOT_STATE.currentPosition > 0) {
+                    const sellAmount = BOT_STATE.currentPosition;
+                    const order = await exchange.createMarketSellOrder(symbol, sellAmount);
+                    if (order && order.status === 'closed') {
+                        const proceeds = close * sellAmount;
+                        const fee = (order.fee?.cost) ?? proceeds * 0.001;
+                        const profit = (close - BOT_STATE.averageEntry) * sellAmount;
+                        BOT_STATE.currentBalance += (proceeds - fee);
+                        BOT_STATE.totalFeesPaid += fee;
+                        BOT_STATE.realizedPnL += profit;
+                        if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
+                        riskManager.recordTrade(profit, Math.abs(close - BOT_STATE.averageEntry) * sellAmount);
+                        db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: sellAmount, fee, pnl: profit });
+                        logger.info(`Executed SELL: ${sellAmount} BTC @ $${close} | PnL: $${profit.toFixed(2)}`);
+                        BOT_STATE.currentPosition = 0;
+                        BOT_STATE.averageEntry = 0;
+                        stopLossManager.clearStop(symbol);
+                    }
+                }
+            }
+
+            // ── STOP LOSS & TAKE PROFIT ───────────────────────────────────
+            if (BOT_STATE.currentPosition > 0) {
+                // Update trailing stop and check for take-profit milestones
+                const tpHit = stopLossManager.updateTrailing(symbol, close);
+                if (tpHit) {
+                    logger.info(`🎯 Take-profit ${tpHit.label} reached @ $${tpHit.price.toFixed(0)} | ${stopLossManager.getStopInfo(symbol)}`);
+                }
+                // Trigger stop if breached
+                if (stopLossManager.shouldStop(symbol, close)) {
+                    logger.error(`🛑 Stop-loss triggered for ${symbol} @ $${close} | ${stopLossManager.getStopInfo(symbol)}`);
+                    sendAlert(`Stop-loss triggered @ $${close}`);
+                    const sellAmount = BOT_STATE.currentPosition;
+                    const order = await exchange.createMarketSellOrder(symbol, sellAmount);
+                    if (order && order.status === 'closed') {
+                        const proceeds = close * sellAmount;
+                        const fee = (order.fee?.cost) ?? proceeds * 0.001;
+                        const profit = (close - BOT_STATE.averageEntry) * sellAmount;
+                        BOT_STATE.currentBalance += (proceeds - fee);
+                        BOT_STATE.totalFeesPaid += fee;
+                        BOT_STATE.realizedPnL += profit;
+                        if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
+                        riskManager.recordTrade(profit, Math.abs(close - BOT_STATE.averageEntry) * sellAmount);
+                        BOT_STATE.currentPosition = 0;
+                        BOT_STATE.averageEntry = 0;
+                        stopLossManager.clearStop(symbol);
+                    }
                 }
             }
 
