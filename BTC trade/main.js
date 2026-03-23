@@ -516,13 +516,60 @@ async function tradingLoop() {
 
             // ── STOP LOSS & TAKE PROFIT ───────────────────────────────────
             if (BOT_STATE.currentPosition > 0) {
-                // Update trailing stop and check for take-profit milestones
+                // Update trailing stop and execute take-profit levels
                 const tpHit = stopLossManager.updateTrailing(symbol, close);
                 if (tpHit) {
-                    logger.info(`🎯 Take-profit ${tpHit.label} reached @ $${tpHit.price.toFixed(0)} | ${stopLossManager.getStopInfo(symbol)}`);
+                    logger.info(`🎯 Take-profit ${tpHit.label} reached @ $${close.toFixed(0)} | ${stopLossManager.getStopInfo(symbol)}`);
+
+                    // ── 2R: Sell 33% of position + move stop to breakeven ──────────
+                    if (tpHit.label === '2R' && BOT_STATE.currentPosition > 0) {
+                        const partialSell = Math.round(BOT_STATE.currentPosition * 0.33 * 1e6) / 1e6;
+                        if (partialSell > 0.000001) {
+                            const partialOrder = await exchange.createMarketSellOrder(symbol, partialSell);
+                            if (partialOrder && partialOrder.status === 'closed') {
+                                const proceeds = close * partialSell;
+                                const fee      = (partialOrder.fee?.cost) ?? proceeds * 0.001;
+                                const profit   = (close - BOT_STATE.averageEntry) * partialSell;
+                                BOT_STATE.currentBalance += (proceeds - fee);
+                                BOT_STATE.totalFeesPaid  += fee;
+                                BOT_STATE.realizedPnL    += profit;
+                                if (profit > 0) BOT_STATE.winTrades++;
+                                BOT_STATE.currentPosition -= partialSell;
+                                riskManager.recordTrade(profit, Math.abs(close - BOT_STATE.averageEntry) * partialSell);
+                                db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: partialSell, fee, pnl: profit, balance: BOT_STATE.currentBalance, notes: 'partial-tp-2R' });
+                                logger.info(`💰 Partial exit (2R — 33%): ${partialSell} BTC @ $${close} | PnL: $${profit.toFixed(2)} | Remaining: ${BOT_STATE.currentPosition.toFixed(6)} BTC`);
+                                dashboard.push({ ...BOT_STATE });
+                            }
+                        }
+                    }
+
+                    // ── 3R: Close entire remaining position ────────────────────────
+                    if (tpHit.label === '3R' && BOT_STATE.currentPosition > 0) {
+                        const fullSell = BOT_STATE.currentPosition;
+                        const fullOrder = await exchange.createMarketSellOrder(symbol, fullSell);
+                        if (fullOrder && fullOrder.status === 'closed') {
+                            const proceeds = close * fullSell;
+                            const fee      = (fullOrder.fee?.cost) ?? proceeds * 0.001;
+                            const profit   = (close - BOT_STATE.averageEntry) * fullSell;
+                            BOT_STATE.currentBalance += (proceeds - fee);
+                            BOT_STATE.totalFeesPaid  += fee;
+                            BOT_STATE.realizedPnL    += profit;
+                            if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
+                            BOT_STATE.currentPosition = 0;
+                            BOT_STATE.averageEntry    = 0;
+                            BOT_STATE.dcaLayers       = [];
+                            cooldown.recordSell();
+                            riskManager.recordTrade(profit, Math.abs(close - BOT_STATE.averageEntry) * fullSell);
+                            db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: fullSell, fee, pnl: profit, balance: BOT_STATE.currentBalance, notes: 'full-tp-3R' });
+                            logger.info(`💰 Full exit (3R — 100%): ${fullSell} BTC @ $${close} | PnL: $${profit.toFixed(2)} | Balance: $${BOT_STATE.currentBalance.toFixed(2)}`);
+                            dashboard.push({ ...BOT_STATE });
+                            stopLossManager.clearStop(symbol);
+                        }
+                    }
                 }
+
                 // Trigger stop if breached
-                if (stopLossManager.shouldStop(symbol, close)) {
+                if (BOT_STATE.currentPosition > 0 && stopLossManager.shouldStop(symbol, close)) {
                     logger.error(`🛑 Stop-loss triggered for ${symbol} @ $${close} | ${stopLossManager.getStopInfo(symbol)}`);
                     sendAlert(`Stop-loss triggered @ $${close}`);
                     const sellAmount = BOT_STATE.currentPosition;
