@@ -30,11 +30,18 @@ export class ExchangeService {
         this._historicalData = null;
         this._simIndex = 250; // Start after 250 candles so EMA200 has enough data
 
+        // If no API credentials are present, go straight to simulation mode.
+        // This happens when CUSTOM_ENVIRONMENT_VARIABLES aren't configured on the host.
+        if (!apiKey || !apiSecret) {
+            this.logger.warn('No API credentials found — running in SIMULATION MODE. Set BINANCE_API_KEY and BINANCE_SECRET_KEY for live/testnet trading.');
+            this.simulationMode = true;
+        }
+
         try {
             const isTestnet = process.env.TESTNET === 'true';
             const exchangeOptions = {
-                apiKey,
-                secret: apiSecret,
+                apiKey:  apiKey  || '',
+                secret:  apiSecret || '',
                 enableRateLimit: true,
                 options: { defaultType: 'spot' }
             };
