@@ -46,11 +46,30 @@
  *    - When in a position and price drops significantly, averaging down reduces the cost basis
  *    - Only DCA when the overall trend is still bullish — never average into a confirmed downtrend
  *
- * 9. CRYPTO-SPECIFIC RULES
- *    - BTC is the most liquid crypto — institutional money moves it, creating strong trends
- *    - Avoid trading in extreme fear/panic (very high ATR) without trend confirmation
- *    - Crypto markets are 24/7 — hourly candles are more reliable than shorter timeframes
- *    - High volume on a breakout is essential; crypto fakes breakouts frequently on low volume
+ * 9. VWAP (Volume Weighted Average Price)
+ *    - The single most-watched indicator by institutional traders
+ *    - Price above VWAP = bullish, institutions are buying
+ *    - Price below VWAP = bearish, institutions are selling
+ *    - VWAP acts as dynamic support/resistance throughout the session
+ *
+ * 10. FIBONACCI RETRACEMENT
+ *    - Price doesn't move in straight lines; it retraces to key Fibonacci levels before continuing
+ *    - 0.382, 0.5, 0.618 retracement levels = the highest probability reversal zones
+ *    - Used by professional traders worldwide — these levels become self-fulfilling
+ *    - Combining Fibonacci with RSI/MACD confirmation eliminates most false signals
+ *
+ * 11. MULTI-TIMEFRAME ANALYSIS (4H confirmation)
+ *    - Entry on 1H, confirmed by 4H trend direction
+ *    - Trading WITH the higher timeframe trend dramatically improves win rate
+ *    - 4H bull trend + 1H buy signal = high probability entry
+ *    - 4H bear trend + 1H sell signal = high probability exit
+ *
+ * 12. FEAR & GREED INDEX
+ *    - Crypto-specific sentiment indicator (alternative.me, updates daily)
+ *    - Extreme Fear (0–25): Market panic — historically best BUY zones for BTC
+ *    - Extreme Greed (75–100): Euphoria — historically best zones to reduce exposure
+ *    - Warren Buffett principle: "Be greedy when others are fearful"
+ *    - Professional bots like Stoic.ai weight sentiment into every signal
  */
 
 import {
@@ -106,7 +125,7 @@ export class StrategyEngine {
         this.minSellScore = minSellScore;
     }
 
-    generateSignal(ohlcv, currentPosition, averageEntry) {
+    generateSignal(ohlcv, currentPosition, averageEntry, fearGreed = null) {
         // Need at least 200 candles for EMA200 to be meaningful
         if (!ohlcv || ohlcv.length < this.emaSlow) {
             return {
@@ -253,7 +272,77 @@ export class StrategyEngine {
         const nearResistance = currentPrice > resistance * 0.98;
         const nearSupport    = currentPrice < support * 1.02;
 
-        // ── 13. DCA CHECK ────────────────────────────────────────────────
+        // ── 13. VWAP (Volume Weighted Average Price) ─────────────────────
+        // Used by institutions as the reference price for the session.
+        // Price > VWAP = bullish bias. Price < VWAP = bearish bias.
+        const vwapLookback = Math.min(closes.length, 48); // 48H rolling VWAP
+        const vwapSlice = ohlcv.slice(-vwapLookback);
+        let vwapNum = 0, vwapDen = 0;
+        for (const c of vwapSlice) {
+            const h = typeof c.high  !== 'undefined' ? c.high  : c[2];
+            const l = typeof c.low   !== 'undefined' ? c.low   : c[3];
+            const cl= typeof c.close !== 'undefined' ? c.close : c[4];
+            const v = typeof c.volume!== 'undefined' ? c.volume: c[5];
+            const typical = (h + l + cl) / 3;
+            vwapNum += typical * v;
+            vwapDen += v;
+        }
+        const vwap = vwapDen > 0 ? vwapNum / vwapDen : currentPrice;
+        const aboveVwap = currentPrice > vwap;
+        const belowVwap = currentPrice < vwap;
+        const vwapDeviation = (currentPrice - vwap) / vwap; // > 0 above, < 0 below
+
+        // ── 14. FIBONACCI RETRACEMENT ────────────────────────────────────
+        // Auto-detect the most recent significant swing high and low
+        // over the last 50 candles. Key levels: 0.382, 0.5, 0.618
+        const fibLookback = Math.min(closes.length, 50);
+        const fibHighs = highs.slice(-fibLookback);
+        const fibLows  = lows.slice(-fibLookback);
+        const fibSwingHigh = Math.max(...fibHighs);
+        const fibSwingLow  = Math.min(...fibLows);
+        const fibRange = fibSwingHigh - fibSwingLow;
+
+        // Support levels (retracement from high — price bounces here during uptrend)
+        const fib618 = fibSwingHigh - fibRange * 0.618; // Strongest support
+        const fib500 = fibSwingHigh - fibRange * 0.5;
+        const fib382 = fibSwingHigh - fibRange * 0.382;
+        const fib236 = fibSwingHigh - fibRange * 0.236; // Weakest support / first target
+
+        const tolerance = fibRange * 0.01; // 1% tolerance band around level
+        const nearFib618 = Math.abs(currentPrice - fib618) < tolerance;
+        const nearFib500 = Math.abs(currentPrice - fib500) < tolerance;
+        const nearFib382 = Math.abs(currentPrice - fib382) < tolerance;
+        const nearFib236 = Math.abs(currentPrice - fib236) < tolerance;
+
+        // Fibonacci support (bullish): price bouncing off fib level from below
+        const atFibSupport = (nearFib618 || nearFib500 || nearFib382) && currentPrice > fibSwingLow * 1.01;
+        // Fibonacci resistance (bearish): price stalling at fib level from above
+        const atFibResistance = (nearFib236 || nearFib382) && currentPrice < fibSwingHigh * 0.99;
+
+        // ── 15. 4H MULTI-TIMEFRAME ANALYSIS ─────────────────────────────
+        // Derive 4H candles from 1H data (group every 4 candles).
+        // A 4H bull trend confirms 1H buy signals with much higher probability.
+        let h4BullTrend = false;
+        let h4BearTrend = false;
+        try {
+            const minFor4H = 4 * (this.emaMid + 10); // Need enough 1H candles
+            if (closes.length >= minFor4H) {
+                const h4Closes = [];
+                for (let i = 0; i + 3 < closes.length; i += 4) {
+                    h4Closes.push(closes[i + 3]); // Use closing price of each 4H bar
+                }
+                if (h4Closes.length >= this.emaMid) {
+                    const h4Ema20 = EMA.calculate({ values: h4Closes, period: this.emaFast });
+                    const h4Ema50 = EMA.calculate({ values: h4Closes, period: this.emaMid });
+                    const h4Last20 = h4Ema20[h4Ema20.length - 1];
+                    const h4Last50 = h4Ema50[h4Ema50.length - 1];
+                    h4BullTrend = h4Last20 > h4Last50;
+                    h4BearTrend = h4Last20 < h4Last50;
+                }
+            }
+        } catch (_) { /* non-critical */ }
+
+        // ── 16. DCA CHECK ────────────────────────────────────────────────
         if (currentPosition > 0 && averageEntry > 0) {
             const priceDrop = (averageEntry - currentPrice) / averageEntry;
             // Only DCA if overall trend is still bullish (EMA alignment + ADX)
@@ -385,6 +474,74 @@ export class StrategyEngine {
             sellReasons.push(`Pattern: ${patternName}`);
         }
 
+        // ── VWAP CONDITIONS ──────────────────────────────────────────────
+        if (aboveVwap && vwapDeviation > 0.001) {
+            buyScore++;
+            buyReasons.push(`Above VWAP $${vwap.toFixed(0)} (institutional bullish bias)`);
+        }
+        if (belowVwap && vwapDeviation < -0.001) {
+            sellScore++;
+            sellReasons.push(`Below VWAP $${vwap.toFixed(0)} (institutional bearish bias)`);
+        }
+        // Very extended above VWAP = overbought warning
+        if (vwapDeviation > 0.03) {
+            sellScore++;
+            sellReasons.push(`Extended ${(vwapDeviation*100).toFixed(1)}% above VWAP (mean reversion risk)`);
+        }
+        if (vwapDeviation < -0.03) {
+            buyScore++;
+            buyReasons.push(`Extended ${(Math.abs(vwapDeviation)*100).toFixed(1)}% below VWAP (mean reversion opportunity)`);
+        }
+
+        // ── FIBONACCI CONDITIONS ─────────────────────────────────────────
+        if (atFibSupport) {
+            buyScore++;
+            const fibLevel = nearFib618 ? '61.8%' : nearFib500 ? '50%' : '38.2%';
+            buyReasons.push(`Fibonacci ${fibLevel} support ($${(nearFib618 ? fib618 : nearFib500 ? fib500 : fib382).toFixed(0)})`);
+        }
+        if (atFibResistance) {
+            sellScore++;
+            const fibLevel = nearFib236 ? '23.6%' : '38.2%';
+            sellReasons.push(`Fibonacci ${fibLevel} resistance — potential reversal zone`);
+        }
+
+        // ── 4H MULTI-TIMEFRAME CONFIRMATION ─────────────────────────────
+        if (h4BullTrend) {
+            buyScore++;
+            buyReasons.push('4H EMA20>EMA50 (higher timeframe bullish)');
+        }
+        if (h4BearTrend) {
+            sellScore++;
+            sellReasons.push('4H EMA20<EMA50 (higher timeframe bearish)');
+        }
+        // Extra weight when 1H and 4H align
+        if (h4BullTrend && bullTrend) {
+            buyScore++;
+            buyReasons.push('1H+4H trend aligned bullish (high confidence)');
+        }
+        if (h4BearTrend && bearTrend) {
+            sellScore++;
+            sellReasons.push('1H+4H trend aligned bearish (high confidence)');
+        }
+
+        // ── FEAR & GREED INDEX ───────────────────────────────────────────
+        if (fearGreed && fearGreed.available) {
+            if (fearGreed.extremeFear) {
+                buyScore += 2;
+                buyReasons.push(`Extreme Fear (${fearGreed.value}) — historically strong BUY zone`);
+            } else if (fearGreed.fear) {
+                buyScore++;
+                buyReasons.push(`Market Fear (${fearGreed.value}) — contrarian bullish`);
+            }
+            if (fearGreed.extremeGreed) {
+                sellScore += 2;
+                sellReasons.push(`Extreme Greed (${fearGreed.value}) — historically strong SELL zone`);
+            } else if (fearGreed.greed && !fearGreed.extremeGreed) {
+                sellScore++;
+                sellReasons.push(`Market Greed (${fearGreed.value}) — contrarian bearish`);
+            }
+        }
+
         // ── PENALTY: Extreme volatility — reduce confidence ──────────────
         if (highVolatility) {
             buyScore  = Math.max(0, buyScore  - 1);
@@ -428,7 +585,15 @@ export class StrategyEngine {
             bbWidth: +(bbWidth * 100).toFixed(2),
             obv: obvRising ? 'rising' : 'falling',
             regime: isTrending ? `TRENDING (ADX ${adx.toFixed(0)})` : isRanging ? `RANGING (ADX ${adx.toFixed(0)})` : `NEUTRAL (ADX ${adx.toFixed(0)})`,
-            roc: +roc.toFixed(2)
+            roc: +roc.toFixed(2),
+            vwap: +vwap.toFixed(2),
+            vwapBias: aboveVwap ? 'above' : 'below',
+            fib618: +fib618.toFixed(2),
+            fib500: +fib500.toFixed(2),
+            fib382: +fib382.toFixed(2),
+            h4Trend: h4BullTrend ? 'BULL' : h4BearTrend ? 'BEAR' : 'NEUTRAL',
+            fearGreedValue: fearGreed?.value ?? null,
+            fearGreedClass: fearGreed?.classification ?? null
         };
 
         if (buyScore >= this.minBuyScore && buyScore > sellScore) {
