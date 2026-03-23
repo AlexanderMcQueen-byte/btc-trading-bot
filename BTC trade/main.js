@@ -184,13 +184,16 @@ async function tradingLoop() {
 
         if (!accountBalance) {
             // Testnet or restricted server: wallet/sapi endpoints may not be available.
-            // In fully live mode this is a hard error; in testnet/paper, warn and continue.
-            const isFullyLive = process.env.TESTNET !== 'true' && process.env.PAPER_TRADE !== 'true';
+            // Only halt in fully live mode: real keys present + no TESTNET/PAPER_TRADE flags.
+            const hasApiKeys  = !!(process.env.BINANCE_API_KEY || process.env.API_KEY);
+            const isFullyLive = process.env.TESTNET             !== 'true'
+                             && process.env.PAPER_TRADE          !== 'true'
+                             && hasApiKeys;
             if (isFullyLive) {
                 logger.error('Could not fetch account balance from exchange. Halting to protect funds.');
                 process.exit(1);
             } else {
-                logger.warn('⚠️  Could not fetch live balance (testnet wallet endpoints may be geo-restricted). Continuing with paper-trade starting balance.');
+                logger.warn('⚠️  Could not fetch live balance (no keys or testnet mode). Continuing with paper-trade starting balance.');
             }
         }
 
