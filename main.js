@@ -15,6 +15,8 @@ import { StrategyEngine } from './modules/strategy_engine.js';
 import { ExchangeService } from './modules/exchange_service.js';
 import logger from './modules/logger.js';
 import { BotDatabase } from './modules/database.js';
+import { CooldownManager } from './modules/cooldown_manager.js';
+import { startDashboard } from './modules/dashboard.js';
 
 // NOTE: We use console.error() for logging because console.log() writes to stdout,
 // which breaks the MCP Stdio Transport (JSON-RPC expects clean stdout).
@@ -53,7 +55,13 @@ const BOT_STATE = {
     winTrades: 0,
     lossTrades: 0,
     maxDrawdown: 0.0,
-    peakBalance: 10000.0
+    peakBalance: 10000.0,
+    // Dashboard extras
+    dcaLayers: [],          // [{entryPrice, size, stopPrice, openedAt}]
+    currentBtcPrice: 0,
+    lastSignal: null,       // {signal, score, reason}
+    cooldown: {},           // {buyRemaining, sellRemaining, blocked}
+    simulationMode: false
 };
 
 const server = new Server(
@@ -128,7 +136,8 @@ async function tradingLoop() {
         minSellScore: 3
     });
     const gridTrader = new GridTrader({ logger });
-    const symbol = process.env.DEFAULT_SYMBOL || "BTC/USDT";
+    const cooldown   = new CooldownManager({ logger });
+    const symbol     = process.env.DEFAULT_SYMBOL || "BTC/USDT";
 
     riskManager = new RiskManager({
         balance: BOT_STATE.currentBalance,
@@ -242,6 +251,18 @@ async function tradingLoop() {
         logger.info('Simulation mode: starting with clean paper-trade state ($10,000 balance).');
     }
 
+    // Update simulationMode flag for dashboard
+    BOT_STATE.simulationMode = exchange.simulationMode;
+
+    // ── Start live dashboard ──────────────────────────────────────────────────
+    const dashboard = startDashboard({
+        getBotState: () => ({ ...BOT_STATE }),
+        db,
+        logger
+    });
+
+    let lastEquitySnapshot = 0;
+
     while (true) {
         try {
             // Hardware kill switch check
@@ -304,6 +325,17 @@ async function tradingLoop() {
                 if (ohlcv.length > 500) ohlcv.shift();
             }
             const close = ohlcv[ohlcv.length - 1][4] ?? ohlcv[ohlcv.length - 1].close;
+            BOT_STATE.currentBtcPrice = close;
+            BOT_STATE.lastUpdate = new Date().toISOString();
+            BOT_STATE.cooldown = cooldown.status();
+
+            // Record equity snapshot every 5 minutes
+            if (Date.now() - lastEquitySnapshot > 5 * 60 * 1000) {
+                try {
+                    db.recordEquitySnapshot({ balance: BOT_STATE.currentBalance, position: BOT_STATE.currentPosition, btcPrice: close });
+                    lastEquitySnapshot = Date.now();
+                } catch (_) {}
+            }
 
             // Circuit breaker — uses total portfolio value (USDT + BTC at current price)
             const portfolioValue = BOT_STATE.currentBalance + (BOT_STATE.currentPosition * close);
@@ -319,6 +351,7 @@ async function tradingLoop() {
 
             // Generate strategy signal (pass Fear & Greed for sentiment scoring)
             const signalData = strategy.generateSignal(ohlcv, BOT_STATE.currentPosition, BOT_STATE.averageEntry, fearGreed);
+            BOT_STATE.lastSignal = { signal: signalData.signal, score: signalData.score, reason: signalData.reason };
             const adx = signalData.indicators?.adx ?? 30;
             const atr = signalData.indicators?.atr ?? close * 0.02;
             logger.info(`[${new Date().toLocaleTimeString()}] Analysis: ${signalData.signal} | ${signalData.reason}`);
@@ -364,8 +397,12 @@ async function tradingLoop() {
                 if (["BUY", "BUY_DCA"].includes(signalData.signal) && BOT_STATE.currentPosition === 0) {
                     const entryPrice = close;
 
+                    // ── Cooldown check ────────────────────────────────────────────────
+                    if (!cooldown.canBuy()) {
+                        // Already logged inside cooldown.canBuy()
+                    }
                     // ── Balance check — always verify funds before sizing ──────────────
-                    if (BOT_STATE.currentBalance <= 0) {
+                    else if (BOT_STATE.currentBalance <= 0) {
                         logger.warn(`Skipping BUY — no USDT balance available ($${BOT_STATE.currentBalance.toFixed(2)}).`);
                     } else {
                         // ATR-based stop loss — never use a fixed % in crypto
@@ -392,8 +429,11 @@ async function tradingLoop() {
                                 BOT_STATE.averageEntry = close;
                                 BOT_STATE.currentBalance -= (cost + fee);
                                 BOT_STATE.totalFeesPaid += fee;
-                                db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'BUY', price: close, amount: buyAmount, fee });
+                                BOT_STATE.dcaLayers = [{ entryPrice: close, size: buyAmount, stopPrice, openedAt: new Date().toISOString() }];
+                                cooldown.recordBuy();
+                                db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'BUY', price: close, amount: buyAmount, fee, balance: BOT_STATE.currentBalance, signalScore: signalData.score });
                                 logger.info(`Executed BUY: ${buyAmount} BTC @ $${close} | Stop: $${stopPrice.toFixed(0)} | ${riskManager.getKellyStats()}`);
+                                dashboard.push({ ...BOT_STATE });
                                 // Set ATR trailing stop
                                 stopLossManager.setStop(symbol, entryPrice, stopPrice, 'BUY', true, atr * 2);
                             }
@@ -411,10 +451,13 @@ async function tradingLoop() {
                         BOT_STATE.realizedPnL += profit;
                         if (profit > 0) BOT_STATE.winTrades++; else BOT_STATE.lossTrades++;
                         riskManager.recordTrade(profit, Math.abs(close - BOT_STATE.averageEntry) * sellAmount);
-                        db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: sellAmount, fee, pnl: profit });
-                        logger.info(`Executed SELL: ${sellAmount} BTC @ $${close} | PnL: $${profit.toFixed(2)}`);
                         BOT_STATE.currentPosition = 0;
                         BOT_STATE.averageEntry = 0;
+                        BOT_STATE.dcaLayers = [];
+                        cooldown.recordSell();
+                        db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: sellAmount, fee, pnl: profit, balance: BOT_STATE.currentBalance, signalScore: signalData.score });
+                        logger.info(`Executed SELL: ${sellAmount} BTC @ $${close} | PnL: $${profit.toFixed(2)}`);
+                        dashboard.push({ ...BOT_STATE });
                         stopLossManager.clearStop(symbol);
                     }
                 }
@@ -444,6 +487,10 @@ async function tradingLoop() {
                         riskManager.recordTrade(profit, Math.abs(close - BOT_STATE.averageEntry) * sellAmount);
                         BOT_STATE.currentPosition = 0;
                         BOT_STATE.averageEntry = 0;
+                        BOT_STATE.dcaLayers = [];
+                        cooldown.recordSell();
+                        db.logTrade({ timestamp: new Date().toISOString(), symbol, side: 'SELL', price: close, amount: sellAmount, fee, pnl: profit, balance: BOT_STATE.currentBalance, notes: 'stop-loss' });
+                        dashboard.push({ ...BOT_STATE });
                         stopLossManager.clearStop(symbol);
                     }
                 }
