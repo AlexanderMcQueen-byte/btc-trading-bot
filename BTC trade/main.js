@@ -25,11 +25,15 @@ import { startDashboard } from './modules/dashboard.js';
 loadEnv();
 
 // IP Whitelist check (cloud security)
-// In LIVE mode: hard exit if IP not whitelisted (prevents API keys being used from unknown servers).
-// In DEV/SIMULATION: warn only — Replit rotates IPs frequently.
+// Only enforced in fully-live mode (real API keys + no TESTNET/PAPER_TRADE flags).
+// Skipped when: testnet mode, paper trade, no API keys present, or DISABLE_IP_WHITELIST=true.
 const serverIp = getServerIp();
 if (!isIpWhitelisted(serverIp)) {
-    const isLive = process.env.TESTNET !== 'true' && process.env.PAPER_TRADE !== 'true';
+    const hasApiKeys = !!(process.env.BINANCE_API_KEY || process.env.API_KEY);
+    const isLive    = process.env.TESTNET             !== 'true'
+                   && process.env.PAPER_TRADE          !== 'true'
+                   && process.env.DISABLE_IP_WHITELIST !== 'true'
+                   && hasApiKeys;
     if (isLive) {
         logger.error(`Server IP ${serverIp} not whitelisted. Exiting for security (live mode).`);
         process.exit(1);
