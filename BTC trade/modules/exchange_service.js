@@ -33,8 +33,11 @@ export class ExchangeService {
         // If no API credentials are present, go straight to simulation mode.
         // This happens when CUSTOM_ENVIRONMENT_VARIABLES aren't configured on the host.
         if (!apiKey || !apiSecret) {
-            this.logger.warn('No API credentials found — running in SIMULATION MODE. Set BINANCE_API_KEY and BINANCE_SECRET_KEY for live/testnet trading.');
+            this.logger.warn('No API credentials found — running in SIMULATION MODE.');
             this.simulationMode = true;
+            if (fs.existsSync(HISTORICAL_DATA_PATH)) {
+                this._historicalData = JSON.parse(fs.readFileSync(HISTORICAL_DATA_PATH, 'utf-8'));
+            }
         }
 
         try {
